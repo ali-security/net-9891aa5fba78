@@ -626,6 +626,16 @@ var tokenTests = []tokenTest{
 		`<p a=/>`,
 		`<p a="/">`,
 	},
+	{
+		"duplicate attributes",
+		`<p foo="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
+	{
+		"duplicate attributes, different case",
+		`<p FOO="bar" foo="baz">`,
+		`<p foo="bar">`,
+	},
 }
 
 func TestTokenizer(t *testing.T) {
@@ -933,3 +943,83 @@ func benchmarkTokenizer(b *testing.B, level int) {
 func BenchmarkRawLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, rawLevel) }
 func BenchmarkLowLevelTokenizer(b *testing.B)  { benchmarkTokenizer(b, lowLevel) }
 func BenchmarkHighLevelTokenizer(b *testing.B) { benchmarkTokenizer(b, highLevel) }
+
+func TestUnicodeAttributeCase(t *testing.T) {
+	// <div a="1" A="1"> is resolved to <div a="1"> because a and A are considered
+	// duplicate attribute names. Different unicode cases are not considered equal
+	// though, so <div ä="1" Ä="1"> is tokenized as <div ä="1" Ä="1">.
+	f := `<div ä="1" Ä="1">`
+	z := NewTokenizer(strings.NewReader(f))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	tok := z.Token()
+	if len(tok.Attr) != 2 {
+		t.Fatalf("expected 2 attributes, got %d", len(tok.Attr))
+	}
+	if tok.Attr[0].Key != "ä" {
+		t.Errorf("expected attribute key to be 'ä', got %s", tok.Attr[0].Key)
+	}
+	if tok.Attr[1].Key != "Ä" {
+		t.Errorf("expected attribute key to be 'Ä', got %s", tok.Attr[1].Key)
+	}
+}
+
+func TestDuplicateAttributesSanitizerConfusion(t *testing.T) {
+	// Browsers keep only the first of several attributes sharing an (ASCII
+	// case-insensitive) name. If the tokenizer kept the later duplicates, a
+	// sanitizer walking the tokens or the parsed tree would see attributes
+	// that the browser ignores, and rendering the tree could emit them.
+	const (
+		input    = `<a href="https://example.com/" HREF="javascript:alert(1)" href="javascript:alert(2)">x</a>`
+		wantHref = "https://example.com/"
+	)
+
+	// Low-level API: TagName and TagAttr.
+	z := NewTokenizer(strings.NewReader(input))
+	if tt := z.Next(); tt != StartTagToken {
+		t.Fatalf("expected StartTagToken, got %s", tt)
+	}
+	var keys, vals []string
+	_, more := z.TagName()
+	for more {
+		var k, v []byte
+		k, v, more = z.TagAttr()
+		keys = append(keys, string(k))
+		vals = append(vals, string(v))
+	}
+	if len(keys) != 1 || keys[0] != "href" || vals[0] != wantHref {
+		t.Errorf("TagAttr: got keys %q values %q, want a single href=%q", keys, vals, wantHref)
+	}
+
+	// Parse tree and rendering.
+	doc, err := Parse(strings.NewReader(input))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var a *Node
+	var find func(*Node)
+	find = func(n *Node) {
+		if n.Type == ElementNode && n.Data == "a" {
+			a = n
+			return
+		}
+		for c := n.FirstChild; c != nil && a == nil; c = c.NextSibling {
+			find(c)
+		}
+	}
+	find(doc)
+	if a == nil {
+		t.Fatal("no <a> element in the parsed tree")
+	}
+	if len(a.Attr) != 1 || a.Attr[0].Key != "href" || a.Attr[0].Val != wantHref {
+		t.Errorf("parsed <a> attributes: got %v, want a single href=%q", a.Attr, wantHref)
+	}
+	var buf bytes.Buffer
+	if err := Render(&buf, doc); err != nil {
+		t.Fatal(err)
+	}
+	if got := buf.String(); strings.Contains(strings.ToLower(got), "javascript:") {
+		t.Errorf("rendered output kept a duplicate attribute: %q", got)
+	}
+}
