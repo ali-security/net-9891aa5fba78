@@ -1,0 +1,102 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Go packages to test (empty runs the full suite)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Build module zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/main.go"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.28.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" golang.org/x/net v0.45.0 "$GITHUB_WORKSPACE" "$RUNNER_TEMP/out/v0.45.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.45.0.zip" | tail -1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.45.0.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go-version: ['1.24', '1.25']
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: false
+      - name: Go version
+        run: go version
+      - name: Build
+        run: |
+          set -eux
+          go build ./...
+      - name: Test
+        run: |
+          set -u
+          set +e
+          go test -json ${{ inputs.test-filter || './...' }} > "$RUNNER_TEMP/test.json"
+          status=$?
+          set -e
+          echo "::group::Per-package results"
+          jq -r 'select(.Test == null and (.Action == "pass" or .Action == "fail" or .Action == "skip")) | "\(.Action | ascii_upcase)\t\(.Package)\t\(.Elapsed // 0)s"' "$RUNNER_TEMP/test.json"
+          echo "::endgroup::"
+          echo "=== Skipped tests (with reasons) ==="
+          jq -rs '
+            (map(select(.Test != null and .Action == "skip") | {key: "\(.Package) \(.Test)", value: true}) | from_entries) as $skips
+            | map(select(.Test != null and .Action == "output" and $skips["\(.Package) \(.Test)"]))
+            | .[] | select(.Output | test("^=== (RUN|PAUSE|CONT)") | not) | "\(.Package) \(.Test): \(.Output | rtrimstr("\n"))"' "$RUNNER_TEMP/test.json"
+          echo "=== Failed tests ==="
+          jq -rs '
+            (map(select(.Test != null and .Action == "fail") | {key: "\(.Package) \(.Test)", value: true}) | from_entries) as $fails
+            | map(select(.Test != null and .Action == "output" and $fails["\(.Package) \(.Test)"]))
+            | .[] | "\(.Package) \(.Test): \(.Output | rtrimstr("\n"))"' "$RUNNER_TEMP/test.json"
+          jq -r 'select(.Action == "output" and .Test == null) | .Output | rtrimstr("\n") | select(test("^(FAIL|panic)|build failed|setup failed"))' "$RUNNER_TEMP/test.json"
+          echo "=== Test summary ==="
+          pass=$(jq -s '[.[] | select(.Test != null and .Action == "pass")] | length' "$RUNNER_TEMP/test.json")
+          fail=$(jq -s '[.[] | select(.Test != null and .Action == "fail")] | length' "$RUNNER_TEMP/test.json")
+          skip=$(jq -s '[.[] | select(.Test != null and .Action == "skip")] | length' "$RUNNER_TEMP/test.json")
+          pkgpass=$(jq -s '[.[] | select(.Test == null and .Action == "pass")] | length' "$RUNNER_TEMP/test.json")
+          pkgfail=$(jq -s '[.[] | select(.Test == null and .Action == "fail")] | length' "$RUNNER_TEMP/test.json")
+          echo "Tests passed: $pass, failed: $fail, skipped: $skip (packages ok: $pkgpass, packages failed: $pkgfail)"
+          echo "go test exit status: $status"
+          exit $status
